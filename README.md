@@ -9,7 +9,10 @@ A small macOS menu bar app that keeps ChatGPT one shortcut away and can bring in
   (your selected text if any, otherwise the main text) and puts it into the message box.
   - **Auto**: adds the page each time you open the window on a new page.
   - **Add page**: adds it on demand.
-  - **👁 privacy switch**: turns all reading off. Per-app ticks are in the menu bar icon's right-click menu.
+  - **Ask about a selection**: select text in Safari, Chrome or Preview → right-click → **Ask ChatGPT**
+    (under Services if macOS groups it there). The selection is sent with the whole page/PDF as
+    background, and the cursor waits for your question. ⌥Space with text selected in Safari/Chrome does the same.
+  - **📃 privacy switch** (page icon): turns all reading off. Per-app ticks are in the menu bar icon's right-click menu.
 
 ## Build
 

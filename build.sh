@@ -25,11 +25,25 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
-  <key>NSAppleEventsUsageDescription</key><string>ChatGPT Bar reads the page open in Safari, Chrome or Preview so ChatGPT can use it as context. You can turn this off any time with the eye button.</string>
+  <key>NSAppleEventsUsageDescription</key><string>ChatGPT Bar reads the page open in Safari, Chrome or Preview so ChatGPT can use it as context. You can turn this off any time with the page button.</string>
   <key>NSMicrophoneUsageDescription</key><string>ChatGPT voice mode uses the microphone.</string>
+  <key>NSServices</key>
+  <array><dict>
+    <key>NSMenuItem</key><dict><key>default</key><string>Ask ChatGPT</string></dict>
+    <key>NSMessage</key><string>askChatGPT</string>
+    <key>NSPortName</key><string>ChatGPT Bar</string>
+    <key>NSSendTypes</key><array><string>public.utf8-plain-text</string><string>NSStringPboardType</string></array>
+    <!-- Only offered in these three apps -->
+    <key>NSRequiredContext</key><dict><key>NSApplicationIdentifier</key>
+      <array><string>com.apple.Safari</string><string>com.google.Chrome</string><string>com.apple.Preview</string></array>
+    </dict>
+  </dict></array>
 </dict></plist>
 PLIST
 
 # "Ad-hoc" signature: free, local-only, lets macOS run the app.
 codesign --force --deep -s - "$APP"
+
+# Tell macOS about the right-click "Ask ChatGPT" service.
+/System/Library/CoreServices/pbs -update 2>/dev/null || true
 echo "Built: $(pwd)/$APP"

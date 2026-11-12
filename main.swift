@@ -44,6 +44,7 @@ enum Settings {
 
 /// What we learn about the page the user is viewing.
 struct PageContext {
+    var bundleID: String = ""
     var browserName: String
     var title: String
     var url: String
@@ -64,6 +65,12 @@ let knownAppOrder = ["com.apple.Safari", "com.google.Chrome", "com.apple.Preview
 /// JavaScript run inside the browser tab.
 /// It returns the selected text if there is any, otherwise the main article text.
 /// (Written with single quotes and no backslashes so it can sit inside an AppleScript string.)
+/// Same as above but always the whole page (used when you ask about a selection,
+/// so ChatGPT gets the surrounding page as background).
+let fullPageJS = "(function(){var el=document.querySelector('article')||document.querySelector('main')||document.body;return el?el.innerText:'';})()"
+/// Just the text you have selected (empty if nothing is selected).
+let selectionJS = "String(window.getSelection())"
+
 let pageTextJS = "(function(){var nl=String.fromCharCode(10);var s=String(window.getSelection());if(s.trim().length>0){return 'SELECTED TEXT:'+nl+s;}var el=document.querySelector('article')||document.querySelector('main')||document.body;return el?el.innerText:'';})()"
 
 /// Runs an AppleScript and returns its text result, or an error message.
@@ -114,13 +121,17 @@ func findPage(lastUsed: String?, includeText: Bool) -> PageContext? {
 }
 
 /// Reads title + URL (+ text if `includeText`) of the front tab of the given browser.
-func readPage(bundleID: String, includeText: Bool) -> PageContext? {
+func readPage(bundleID: String, includeText: Bool, wholePage: Bool = false) -> PageContext? {
     guard let browser = knownBrowsers[bundleID] else { return nil }
     // Never launch a browser by accident: only talk to it if it is already running.
     guard !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty else { return nil }
 
     let app = browser.appName
-    if browser.kind == "preview" { return readPreview(includeText: includeText) }
+    if browser.kind == "preview" {
+        var ctx = readPreview(includeText: includeText)
+        ctx?.bundleID = bundleID
+        return ctx
+    }
     // AppleScript vocabulary differs: Safari says "current tab", Chrome says "active tab".
     let tab = browser.kind == "safari" ? "current tab of front window" : "active tab of front window"
     let titleWord = browser.kind == "safari" ? "name" : "title"
@@ -136,13 +147,14 @@ func readPage(bundleID: String, includeText: Bool) -> PageContext? {
     if let error = info.error { lastReadError = "\(app): \(error)" }
     guard let raw = info.result, !raw.isEmpty else { return nil }
     let parts = raw.components(separatedBy: "\n")
-    var ctx = PageContext(browserName: app, title: parts.first ?? "", url: parts.count > 1 ? parts[1] : "", text: nil, error: nil)
+    var ctx = PageContext(bundleID: bundleID, browserName: app, title: parts.first ?? "", url: parts.count > 1 ? parts[1] : "", text: nil, error: nil)
     if !includeText { return ctx }
+    let pageJS = wholePage ? fullPageJS : pageTextJS
 
     // 2) Page text (needs "Allow JavaScript from Apple Events" turned on in the browser).
     let jsScript = browser.kind == "safari"
-        ? "tell application \"\(app)\" to do JavaScript \"\(pageTextJS)\" in \(tab)"
-        : "tell application \"\(app)\" to execute \(tab) javascript \"\(pageTextJS)\""
+        ? "tell application \"\(app)\" to do JavaScript \"\(pageJS)\" in \(tab)"
+        : "tell application \"\(app)\" to execute \(tab) javascript \"\(pageJS)\""
     let js = runAppleScript(jsScript)
     if let text = js.result, !text.isEmpty {
         ctx.text = text
@@ -150,6 +162,32 @@ func readPage(bundleID: String, includeText: Bool) -> PageContext? {
         ctx.error = js.error ?? "Page returned no text"
     }
     return ctx
+}
+
+/// The text currently selected in Safari/Chrome ("" if none or not allowed).
+/// (Preview selections arrive through the right-click "Ask ChatGPT" service instead.)
+func readSelection(bundleID: String) -> String {
+    guard let browser = knownBrowsers[bundleID], browser.kind != "preview" else { return "" }
+    let tab = browser.kind == "safari" ? "current tab of front window" : "active tab of front window"
+    let script = browser.kind == "safari"
+        ? "tell application \"\(browser.appName)\" to do JavaScript \"\(selectionJS)\" in \(tab)"
+        : "tell application \"\(browser.appName)\" to execute \(tab) javascript \"\(selectionJS)\""
+    return (runAppleScript(script).result ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// Long documents (e.g. a whole book in Preview) are cut to `limit` characters,
+/// keeping the part AROUND your selection rather than just the beginning.
+func excerpt(_ text: String, around selection: String, limit: Int) -> String {
+    if text.count <= limit { return text }
+    let probe = String(selection.prefix(80))
+    guard !probe.isEmpty, let hit = text.range(of: probe) else {
+        return String(text.prefix(limit)) + "\n[…cut at \(limit) characters…]"
+    }
+    let center = text.distance(from: text.startIndex, to: hit.lowerBound)
+    let startOffset = max(0, min(center - limit / 2, text.count - limit))
+    let start = text.index(text.startIndex, offsetBy: startOffset)
+    let end = text.index(start, offsetBy: limit)
+    return "[…earlier text cut…]\n" + text[start..<end] + "\n[…later text cut…]"
 }
 
 /// Preview: get the open document's name and file path, then read a PDF's text with PDFKit.
@@ -183,12 +221,14 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
     let pageLabel = NSTextField(labelWithString: "No page")
     let autoCheckbox = NSButton(checkboxWithTitle: "Auto", target: nil, action: nil)
     let pinButton = NSButton()
-    let privacyButton = NSButton()               // 👁 privacy switch: page reading on/off
+    let privacyButton = NSButton()               // 📃 privacy switch: page reading on/off
     let addButton = NSButton()
     var popupWindows: [NSWindow] = []        // login popups (Google/Apple/Microsoft)
     var pageLoaded = false
     var lastAutoURL = ""                     // page we already auto-added (avoid duplicates)
     var pendingAutoAdd = false               // auto-add waiting for the page to finish loading
+    var lastSelection = ""                   // selection we already asked about (avoid duplicates)
+    var suppressAutoOnce = false             // skip auto-add when "Ask ChatGPT" opened the window
 
     /// Which browser to read from — set by the AppDelegate.
     var browserBundleID: () -> String? = { nil }
@@ -290,17 +330,21 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
     @objc func newChat() { webView.load(URLRequest(url: URL(string: "https://chatgpt.com/")!)) }
     @objc func reload() { webView.reload() }
     @objc func addPageClicked() { addPage(manual: true) }
-    /// 👁 button: turn all page reading on or off.
+    /// 📃 button: turn all page reading on or off.
     @objc func privacyToggled() {
         Settings.readingEnabled.toggle()
         refreshPrivacyUI()
         if Settings.readingEnabled { windowDidAppear() }
     }
 
-    /// Updates the eye icon and greys out Add page / Auto while reading is off.
+    /// Updates the page icon and greys out Add page / Auto while reading is off.
     func refreshPrivacyUI() {
         let on = Settings.readingEnabled
-        privacyButton.image = NSImage(systemSymbolName: on ? "eye" : "eye.slash", accessibilityDescription: "Page reading")
+        // A plain page icon (📃). When reading is off: the crossed-out page, in red.
+        // ("text.page.slash" needs macOS 15; older macOS falls back to an empty page.)
+        let offIcon = NSImage(systemSymbolName: "text.page.slash", accessibilityDescription: "Page reading off")
+            ?? NSImage(systemSymbolName: "doc", accessibilityDescription: "Page reading off")
+        privacyButton.image = on ? NSImage(systemSymbolName: "doc.text", accessibilityDescription: "Page reading on") : offIcon
         privacyButton.contentTintColor = on ? nil : .systemRed
         privacyButton.toolTip = on
             ? "Page reading is ON (Safari, Chrome, Preview). Click to turn it off for privacy."
@@ -326,6 +370,7 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
     /// Called every time the window opens: show the page name and auto-add if enabled.
     func windowDidAppear() {
         view.window?.makeFirstResponder(webView)
+        if suppressAutoOnce { suppressAutoOnce = false; return }   // "Ask ChatGPT" handles this opening
         guard Settings.readingEnabled else { refreshPrivacyUI(); return }
         guard let ctx = findPage(lastUsed: browserBundleID(), includeText: false) else {
             pageLabel.stringValue = isPermissionError ? "Needs permission — click Add page" : "Open a page in Safari, Chrome or Preview"
@@ -334,6 +379,15 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
         }
         pageLabel.stringValue = ctx.title.isEmpty ? ctx.url : ctx.title
         pageLabel.toolTip = "\(ctx.browserName): \(ctx.url)"
+
+        // Text selected in Safari/Chrome? Ask about that selection (with the page as background).
+        if Settings.autoContext && Settings.isAppAllowed(ctx.bundleID) {
+            let selection = readSelection(bundleID: ctx.bundleID)
+            if !selection.isEmpty && selection != lastSelection {
+                ask(selection: selection, sourceID: ctx.bundleID)
+                return
+            }
+        }
 
         // Auto mode: only once per page, and never for ChatGPT itself or empty tabs.
         let isUsefulPage = (ctx.url.hasPrefix("http") || ctx.url.hasPrefix("file:")) && !ctx.url.contains("chatgpt.com")
@@ -368,6 +422,32 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
         message += "\n---\n"
         insertIntoComposer(message, attemptsLeft: 10)
         pageLabel.stringValue = (ctx.text != nil ? "Added: " : "Added link only: ") + (ctx.title.isEmpty ? ctx.url : ctx.title)
+    }
+
+    /// "Ask about this selection": puts the selected text in the message box, plus the whole
+    /// page/PDF as background, then leaves the cursor for your question.
+    /// If the 📃 privacy switch is off, only the selected text (which you chose to send) is used.
+    func ask(selection: String, sourceID: String?) {
+        lastSelection = selection
+        var ctx: PageContext? = nil
+        if Settings.readingEnabled, let id = sourceID, knownBrowsers[id] != nil, Settings.isAppAllowed(id) {
+            ctx = readPage(bundleID: id, includeText: true, wholePage: true)
+        }
+        var message = ""
+        if let ctx = ctx {
+            lastAutoURL = ctx.url                       // don't also auto-add this page
+            let isFile = ctx.url.hasPrefix("file:")
+            let source = isFile ? "file: \(URL(string: ctx.url)?.path ?? ctx.url)" : ctx.url
+            message += "I'm reading \"\(ctx.title)\" in \(ctx.browserName) (\(source)).\n\n"
+        }
+        message += "I selected this part:\n\"\"\"\n\(selection)\n\"\"\"\n"
+        if let text = ctx?.text {
+            message += "\nFull text for background (use it to answer, focusing on the selected part):\n\(excerpt(text, around: selection, limit: 40_000))\n"
+        }
+        message += "\n---\nMy question about the selected part: "
+        insertIntoComposer(message, attemptsLeft: 12)
+        pageLabel.stringValue = "Asking about: \"" + selection.prefix(40) + (selection.count > 40 ? "…\"" : "\"")
+        pageLabel.toolTip = selection
     }
 
     /// Puts text into ChatGPT's message box. Retries a few times because the box appears
@@ -584,6 +664,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         buildWindow()
         registerHotKey()
 
+        // Right-click → "Ask ChatGPT" on selected text (Safari, Chrome, Preview only — see build.sh).
+        NSApp.servicesProvider = self
+        NSUpdateDynamicServices()
+
         // Remember which browser you used last, so we know whose page to read.
         if let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier, knownBrowsers[front] != nil {
             lastBrowserID = front
@@ -678,8 +762,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 hideWindow()
             } else {
                 // Visible but behind another app → just bring it to the front.
-                NSApp.activate(ignoringOtherApps: true)
-                window.makeKeyAndOrderFront(nil)
+                bringToFront()
                 chat.windowDidAppear()
             }
         } else {
@@ -691,10 +774,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // If the saved spot is on a monitor that's no longer connected, use the bottom-right corner.
         if !isOnSomeScreen(window.frame) { window.setFrame(bottomRightFrame(size: window.frame.size), display: false) }
         keepFullyOnScreen()
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
+        bringToFront()
         if !Settings.pinned { startOutsideMonitor() }
         chat.windowDidAppear()
+    }
+
+    /// Puts the window on top of every other app and makes it ready for typing.
+    /// (Newer macOS can refuse to switch apps while you're typing elsewhere, so we also
+    /// use orderFrontRegardless, which always shows the window on top.)
+    func bringToFront() {
+        if #available(macOS 14.0, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
     }
 
     func hideWindow() {
@@ -735,6 +826,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func stopOutsideMonitor() {
         if let m = clickOutsideMonitor { NSEvent.removeMonitor(m); clickOutsideMonitor = nil }
+    }
+
+    /// Called by macOS when you pick "Ask ChatGPT" on selected text.
+    @objc func askChatGPT(_ pboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>) {
+        let selection = (pboard.string(forType: .string) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !selection.isEmpty else { return }
+        // The app you right-clicked in is still the front app at this moment.
+        let source = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? lastBrowserID
+        if window.isVisible {
+            bringToFront()
+        } else {
+            chat.suppressAutoOnce = true
+            showWindow()
+        }
+        chat.ask(selection: selection, sourceID: source)
     }
 
     @objc func toggleReading() {
