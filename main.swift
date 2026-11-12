@@ -26,6 +26,16 @@ enum Settings {
     static func setAppAllowed(_ bundleID: String, _ allowed: Bool) {
         UserDefaults.standard.set(allowed, forKey: "allow." + bundleID)
     }
+    /// Open a ChatGPT Temporary Chat (not saved to history/memory) before inserting page context.
+    static var useTemporaryChat: Bool {
+        get { UserDefaults.standard.object(forKey: "useTemporaryChat") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "useTemporaryChat") }
+    }
+    /// Mask emails / phone / card / ID numbers and strip link tokens in page text.
+    static var redact: Bool {
+        get { UserDefaults.standard.object(forKey: "redact") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "redact") }
+    }
     static var autoContext: Bool {
         get { UserDefaults.standard.object(forKey: "autoContext") as? Bool ?? true }   // ON by default
         set { UserDefaults.standard.set(newValue, forKey: "autoContext") }
@@ -50,6 +60,7 @@ struct PageContext {
     var url: String
     var text: String?        // nil when we could not read the page text
     var error: String?       // explains why text could not be read
+    var shield: Shield = .none   // set when we deliberately did NOT read (private window, blocked site)
 }
 
 /// The only apps ChatGPT Bar may read from (through AppleScript).
@@ -61,6 +72,227 @@ let knownBrowsers: [String: (appName: String, kind: String)] = [
 ]
 /// Order used in menus.
 let knownAppOrder = ["com.apple.Safari", "com.google.Chrome", "com.apple.Preview"]
+
+// MARK: - Privacy: private windows, blocked sites, hiding personal details
+
+/// Why a page was deliberately not read.
+enum Shield {
+    case none            // fine to read
+    case privateWindow   // Safari Private / Chrome Incognito window
+    case unverified      // couldn't confirm it's NOT private → treated as private (fail-safe)
+    case blockedSite     // site is on the blocked-sites list
+}
+
+/// Short message for the toolbar.
+func shieldMessage(_ shield: Shield, app: String) -> String {
+    switch shield {
+    case .privateWindow: return "Private window — nothing read"
+    case .unverified:    return app == "Safari" ? "Safari not read — allow Accessibility to check for private windows" : "\(app) not read — couldn't check for Incognito"
+    case .blockedSite:   return "Blocked site — nothing read"
+    case .none:          return ""
+    }
+}
+
+var askedForAccessibility = false   // only show the macOS Accessibility prompt once per launch
+
+/// Is the front window of this app a private / Incognito window?
+/// This runs BEFORE anything is read from the page.
+func privateWindowCheck(bundleID: String) -> Shield {
+    guard let browser = knownBrowsers[bundleID] else { return .none }
+    switch browser.kind {
+    case "chromium":
+        // Chrome tells us directly: "incognito" or "normal".
+        let r = runAppleScript("tell application \"\(browser.appName)\" to if (count of windows) > 0 then return mode of front window")
+        if let error = r.error { lastReadError = "\(browser.appName): \(error)"; return .unverified }
+        return r.result == "incognito" ? .privateWindow : .none
+    case "safari":
+        // Safari's AppleScript can't tell private windows apart, but macOS Accessibility
+        // names them "<page>, Private Browsing". No permission → don't read Safari at all.
+        guard AXIsProcessTrusted() else {
+            if !askedForAccessibility {
+                askedForAccessibility = true
+                let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+                _ = AXIsProcessTrustedWithOptions(options)          // shows the macOS permission prompt
+            }
+            return .unverified
+        }
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else { return .none }
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        var windowRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(axApp, kAXMainWindowAttribute as CFString, &windowRef) != .success,
+           AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &windowRef) != .success {
+            return .unverified
+        }
+        var titleRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(windowRef as! AXUIElement, kAXTitleAttribute as CFString, &titleRef)
+        let title = (titleRef as? String) ?? ""
+        return title.contains("Private Browsing") ? .privateWindow : .none
+    default:
+        return .none     // Preview has no private mode
+    }
+}
+
+/// The blocked-sites list lives in a plain text file you can edit.
+let blocklistURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    .appendingPathComponent("ChatGPT Bar/blocked-sites.txt")
+
+let defaultBlocklist = """
+# ChatGPT Bar never reads pages from these sites (treated like a private window).
+# One site per line. "example.com" also covers its subdomains (mail.example.com).
+# Use * as a wildcard, e.g. *bank* blocks every site with "bank" in its name.
+# Lines starting with # are ignored. Save the file; changes apply right away.
+
+# Email
+mail.google.com
+outlook.live.com
+outlook.office.com
+outlook.office365.com
+mail.yahoo.com
+mail.proton.me
+icloud.com
+
+# Sign-in pages
+accounts.google.com
+login.microsoftonline.com
+appleid.apple.com
+account.apple.com
+*login*
+*signin*
+
+# Password managers
+1password.com
+lastpass.com
+bitwarden.com
+dashlane.com
+
+# Banks and cards
+*bank*
+onlinesbi.sbi
+sbi.co.in
+sbicard.com
+kotak.com
+americanexpress.com
+chase.com
+wellsfargo.com
+citi.com
+capitalone.com
+
+# Payments
+paypal.com
+paytm.com
+phonepe.com
+pay.google.com
+razorpay.com
+cred.club
+
+# Investing and crypto
+zerodha.com
+groww.in
+upstox.com
+angelone.in
+robinhood.com
+fidelity.com
+vanguard.com
+schwab.com
+coinbase.com
+binance.com
+
+# Health
+practo.com
+1mg.com
+pharmeasy.in
+apollo247.com
+*mychart*
+*patient*
+
+# Government IDs and tax
+incometax.gov.in
+uidai.gov.in
+digilocker.gov.in
+epfindia.gov.in
+irs.gov
+"""
+
+/// Reads the list (creating it with the defaults the first time).
+func loadBlocklist() -> [String] {
+    if !FileManager.default.fileExists(atPath: blocklistURL.path) {
+        try? FileManager.default.createDirectory(at: blocklistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? defaultBlocklist.write(to: blocklistURL, atomically: true, encoding: .utf8)
+    }
+    let text = (try? String(contentsOf: blocklistURL, encoding: .utf8)) ?? defaultBlocklist
+    return text.components(separatedBy: .newlines)
+        .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+        .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+}
+
+/// True if this web address is on the blocked-sites list.
+func isBlockedSite(_ urlString: String) -> Bool {
+    guard let host = URL(string: urlString)?.host?.lowercased() else { return false }
+    for entry in loadBlocklist() {
+        if entry.contains("*") {
+            if NSPredicate(format: "SELF LIKE %@", entry).evaluate(with: host) { return true }
+        } else if host == entry || host.hasSuffix("." + entry) {
+            return true
+        }
+    }
+    return false
+}
+
+/// Removes the "?…" and "#…" part of a link — that's where login/tracking tokens live.
+func stripLinkTokens(_ url: String) -> String {
+    guard var parts = URLComponents(string: url), parts.scheme?.hasPrefix("http") == true else { return url }
+    parts.query = nil
+    parts.fragment = nil
+    return parts.string ?? url
+}
+
+/// Replaces every regex match with whatever `transform` returns (nil = leave it alone).
+func replaceMatches(_ pattern: String, in text: String, _ transform: (String) -> String?) -> String {
+    guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return text }
+    var result = text
+    // Go backwards so earlier positions stay valid while we replace.
+    for match in regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).reversed() {
+        guard let range = Range(match.range, in: result) else { continue }
+        if let replacement = transform(String(result[range])) { result.replaceSubrange(range, with: replacement) }
+    }
+    return result
+}
+
+/// Luhn checksum — real card numbers pass it, random digit runs usually don't.
+func passesLuhn(_ digits: String) -> Bool {
+    var sum = 0
+    for (i, ch) in digits.reversed().enumerated() {
+        guard var d = ch.wholeNumberValue else { return false }
+        if i % 2 == 1 { d *= 2; if d > 9 { d -= 9 } }
+        sum += d
+    }
+    return sum % 10 == 0
+}
+
+/// Hides personal details in page text before it goes to ChatGPT.
+func redactPersonalDetails(_ text: String) -> String {
+    let digitsOnly = { (s: String) in s.filter(\.isNumber) }
+    var t = text
+    // 1) Links: drop ?query and #fragment (tokens), keep the address.
+    t = replaceMatches(#"https?://[^\s?#]+[?#][^\s)\]>"']*"#, in: t) { link in
+        String(link.prefix { $0 != "?" && $0 != "#" })
+    }
+    // 2) Email addresses.
+    t = replaceMatches(#"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}"#, in: t) { _ in "[email]" }
+    // 3) Card numbers: 13–19 digits (spaces/dashes allowed) that pass the Luhn check.
+    t = replaceMatches(#"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)"#, in: t) { m in
+        passesLuhn(digitsOnly(m)) ? "[card]" : nil
+    }
+    // 4) 12-digit ID numbers written in groups of 4 (e.g. Aadhaar).
+    //    (Not when it's part of a longer digit run, e.g. a 16-digit number.)
+    t = replaceMatches(#"(?<!\d)(?<!\d[ -])\d{4}[ -]\d{4}[ -]\d{4}(?![ -]?\d)"#, in: t) { _ in "[id-number]" }
+    // 5) Phone numbers: 10–13 digits, optional +country code, spaces/dashes/brackets.
+    //    (A full stop right after is fine; "98.4" style decimals are not phones.)
+    t = replaceMatches(#"(?<![\w.,/])(?:\+\d{1,3}[\s-]?)?(?:\(?\d{2,5}\)?[\s-]?){1,4}\d{2,5}(?!\w|[.,]\d|/)"#, in: t) { m in
+        (10...13).contains(digitsOnly(m).count) ? "[phone]" : nil
+    }
+    return t
+}
 
 /// JavaScript run inside the browser tab.
 /// It returns the selected text if there is any, otherwise the main article text.
@@ -132,6 +364,12 @@ func readPage(bundleID: String, includeText: Bool, wholePage: Bool = false) -> P
         ctx?.bundleID = bundleID
         return ctx
     }
+    // Privacy first: private / Incognito windows are never read — not even the title.
+    let shield = privateWindowCheck(bundleID: bundleID)
+    if shield != .none {
+        return PageContext(bundleID: bundleID, browserName: app, title: "", url: "", text: nil, error: nil, shield: shield)
+    }
+
     // AppleScript vocabulary differs: Safari says "current tab", Chrome says "active tab".
     let tab = browser.kind == "safari" ? "current tab of front window" : "active tab of front window"
     let titleWord = browser.kind == "safari" ? "name" : "title"
@@ -148,6 +386,10 @@ func readPage(bundleID: String, includeText: Bool, wholePage: Bool = false) -> P
     guard let raw = info.result, !raw.isEmpty else { return nil }
     let parts = raw.components(separatedBy: "\n")
     var ctx = PageContext(bundleID: bundleID, browserName: app, title: parts.first ?? "", url: parts.count > 1 ? parts[1] : "", text: nil, error: nil)
+    // Blocked site (bank, email, …)? Forget what we saw and read nothing.
+    if isBlockedSite(ctx.url) {
+        return PageContext(bundleID: bundleID, browserName: app, title: "", url: "", text: nil, error: nil, shield: .blockedSite)
+    }
     if !includeText { return ctx }
     let pageJS = wholePage ? fullPageJS : pageTextJS
 
@@ -168,6 +410,7 @@ func readPage(bundleID: String, includeText: Bool, wholePage: Bool = false) -> P
 /// (Preview selections arrive through the right-click "Ask ChatGPT" service instead.)
 func readSelection(bundleID: String) -> String {
     guard let browser = knownBrowsers[bundleID], browser.kind != "preview" else { return "" }
+    guard privateWindowCheck(bundleID: bundleID) == .none else { return "" }   // never peek into private windows
     let tab = browser.kind == "safari" ? "current tab of front window" : "active tab of front window"
     let script = browser.kind == "safari"
         ? "tell application \"\(browser.appName)\" to do JavaScript \"\(selectionJS)\" in \(tab)"
@@ -377,6 +620,12 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
             pageLabel.toolTip = lastReadError
             return
         }
+        // Private window or blocked site: say so, and do nothing else.
+        if ctx.shield != .none {
+            pageLabel.stringValue = shieldMessage(ctx.shield, app: ctx.browserName)
+            pageLabel.toolTip = pageLabel.stringValue
+            return
+        }
         pageLabel.stringValue = ctx.title.isEmpty ? ctx.url : ctx.title
         pageLabel.toolTip = "\(ctx.browserName): \(ctx.url)"
 
@@ -404,13 +653,21 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
             if manual { showReadFailureHelp() }
             return
         }
+        if ctx.shield != .none {
+            pageLabel.stringValue = shieldMessage(ctx.shield, app: ctx.browserName)
+            pageLabel.toolTip = pageLabel.stringValue
+            if manual { NSSound.beep() }
+            return
+        }
         lastAutoURL = ctx.url
 
         let isFile = ctx.url.hasPrefix("file:")
+        let shownURL = Settings.redact ? stripLinkTokens(ctx.url) : ctx.url
         var message = isFile
             ? "Context from the document I'm viewing in \(ctx.browserName):\nTitle: \(ctx.title)\nFile: \(URL(string: ctx.url)?.path ?? ctx.url)\n"
-            : "Context from the page I'm viewing:\nTitle: \(ctx.title)\nURL: \(ctx.url)\n"
+            : "Context from the page I'm viewing:\nTitle: \(ctx.title)\nURL: \(shownURL)\n"
         if var text = ctx.text {
+            if Settings.redact { text = redactPersonalDetails(text) }
             // Very long pages are cut so the message stays reasonable.
             let limit = 60_000
             if text.count > limit { text = String(text.prefix(limit)) + "\n[…page text cut at \(limit) characters…]" }
@@ -420,7 +677,7 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
             showJavaScriptHelp(browser: ctx.browserName, error: ctx.error ?? "")
         }
         message += "\n---\n"
-        insertIntoComposer(message, attemptsLeft: 10)
+        deliver(message)
         pageLabel.stringValue = (ctx.text != nil ? "Added: " : "Added link only: ") + (ctx.title.isEmpty ? ctx.url : ctx.title)
     }
 
@@ -433,21 +690,46 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
         if Settings.readingEnabled, let id = sourceID, knownBrowsers[id] != nil, Settings.isAppAllowed(id) {
             ctx = readPage(bundleID: id, includeText: true, wholePage: true)
         }
+        // Private window / blocked site: you chose to send the selection, but nothing else is used.
+        let shielded = ctx?.shield ?? .none
+        if shielded != .none { ctx = nil }
         var message = ""
         if let ctx = ctx {
             lastAutoURL = ctx.url                       // don't also auto-add this page
             let isFile = ctx.url.hasPrefix("file:")
-            let source = isFile ? "file: \(URL(string: ctx.url)?.path ?? ctx.url)" : ctx.url
+            let shownURL = Settings.redact ? stripLinkTokens(ctx.url) : ctx.url
+            let source = isFile ? "file: \(URL(string: ctx.url)?.path ?? ctx.url)" : shownURL
             message += "I'm reading \"\(ctx.title)\" in \(ctx.browserName) (\(source)).\n\n"
         }
+        // Your own selection is sent exactly as you selected it.
         message += "I selected this part:\n\"\"\"\n\(selection)\n\"\"\"\n"
-        if let text = ctx?.text {
+        if var text = ctx?.text {
+            if Settings.redact { text = redactPersonalDetails(text) }
             message += "\nFull text for background (use it to answer, focusing on the selected part):\n\(excerpt(text, around: selection, limit: 40_000))\n"
         }
         message += "\n---\nMy question about the selected part: "
-        insertIntoComposer(message, attemptsLeft: 12)
-        pageLabel.stringValue = "Asking about: \"" + selection.prefix(40) + (selection.count > 40 ? "…\"" : "\"")
+        deliver(message)
+        if shielded != .none {
+            pageLabel.stringValue = shieldMessage(shielded, app: knownBrowsers[sourceID ?? ""]?.appName ?? "") + " — only your selection was sent"
+        } else {
+            pageLabel.stringValue = "Asking about: \"" + selection.prefix(40) + (selection.count > 40 ? "…\"" : "\"")
+        }
         pageLabel.toolTip = selection
+    }
+
+    var pendingInsert: String?               // text waiting for the Temporary Chat to load
+
+    /// True when the ChatGPT page is a Temporary Chat (not saved to history or memory).
+    var isTemporaryChat: Bool { webView.url?.query?.contains("temporary-chat=true") == true }
+
+    /// Sends page context to the message box — inside a Temporary Chat when that setting is on.
+    func deliver(_ text: String) {
+        if Settings.useTemporaryChat && !isTemporaryChat {
+            pendingInsert = text                 // inserted once the Temporary Chat finishes loading
+            webView.load(URLRequest(url: URL(string: "https://chatgpt.com/?temporary-chat=true")!))
+        } else {
+            insertIntoComposer(text, attemptsLeft: 12)
+        }
     }
 
     /// Puts text into ChatGPT's message box. Retries a few times because the box appears
@@ -528,6 +810,7 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         if webView == self.webView {
             pageLoaded = true
+            if let text = pendingInsert { pendingInsert = nil; insertIntoComposer(text, attemptsLeft: 12) }
             if pendingAutoAdd { pendingAutoAdd = false; addPage(manual: false) }
         }
     }
@@ -854,6 +1137,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         Settings.setAppAllowed(id, !Settings.isAppAllowed(id))
     }
 
+    @objc func toggleTemporaryChat() { Settings.useTemporaryChat.toggle() }
+    @objc func toggleRedact() { Settings.redact.toggle() }
+
+    /// Opens the blocked-sites text file (creating it first if needed).
+    @objc func editBlocklist() {
+        _ = loadBlocklist()
+        NSWorkspace.shared.open(blocklistURL)
+    }
+
+    @objc func openAccessibilitySettings() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+    }
+
     @objc func resetPosition() {
         window.setFrame(bottomRightFrame(size: normalSize), display: true, animate: window.isVisible)
     }
@@ -886,6 +1182,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             item.state = Settings.isAppAllowed(id) ? .on : .off
             item.isEnabled = Settings.readingEnabled
             menu.addItem(item)
+        }
+        let temp = NSMenuItem(title: "Use Temporary Chat for Page Context", action: #selector(toggleTemporaryChat), keyEquivalent: "")
+        temp.target = self
+        temp.state = Settings.useTemporaryChat ? .on : .off
+        menu.addItem(temp)
+        let redact = NSMenuItem(title: "Hide Emails, Phones, Cards & Link Tokens", action: #selector(toggleRedact), keyEquivalent: "")
+        redact.target = self
+        redact.state = Settings.redact ? .on : .off
+        menu.addItem(redact)
+        let blocked = NSMenuItem(title: "Edit Blocked Sites…", action: #selector(editBlocklist), keyEquivalent: "")
+        blocked.target = self
+        menu.addItem(blocked)
+        if !AXIsProcessTrusted() {
+            let ax = NSMenuItem(title: "Allow Accessibility (Safari private check)…", action: #selector(openAccessibilitySettings), keyEquivalent: "")
+            ax.target = self
+            menu.addItem(ax)
         }
         menu.addItem(.separator())
         let hint = NSMenuItem(title: "Show / hide: ⌥Space", action: nil, keyEquivalent: "")

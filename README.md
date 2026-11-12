@@ -14,6 +14,18 @@ A small macOS menu bar app that keeps ChatGPT one shortcut away and can bring in
     background, and the cursor waits for your question. ⌥Space with text selected in Safari/Chrome does the same.
   - **📃 privacy switch** (page icon): turns all reading off. Per-app ticks are in the menu bar icon's right-click menu.
 
+## Privacy
+
+- **Private windows are never read.** Chrome Incognito is detected directly. Safari Private is detected
+  through macOS Accessibility (grant it once); without that permission Safari is simply not read (fail-safe).
+  In a private window, right-click → Ask ChatGPT sends **only the text you selected**, never the page, title or link.
+- **Blocked sites** (email, banks, payments, password managers, health, sign-in pages…) are treated the same way.
+  Edit the list from the menu bar icon's right-click menu → *Edit Blocked Sites…*
+- **Temporary Chat**: page context goes into a ChatGPT Temporary Chat (not saved to history or memory).
+- **Hidden details**: emails, phone numbers, card numbers, 12-digit ID numbers and link tokens (`?…`) are
+  masked in page text before it is inserted. Your own selected text is sent as-is.
+- All of these can be switched in the right-click menu; the 📃 button turns all reading off.
+
 ## Build
 
 No Xcode project and no paid Apple developer account needed, just the Command Line Tools.
