@@ -1,0 +1,3 @@
+# Built app (recreate with ./build.sh)
+build/
+.DS_Store
