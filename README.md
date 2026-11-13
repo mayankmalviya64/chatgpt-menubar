@@ -30,7 +30,9 @@ reading or listening to. (Formerly called "ChatGPT Bar"; settings carry over aut
   In a private window, right-click → Ask ChatGPT sends **only the text you selected**, never the page, title or link.
 - **Blocked sites** (email, banks, payments, password managers, health, sign-in pages…) are treated the same way.
   Edit the list from the menu bar icon's right-click menu → *Edit Blocked Sites…*
-- **Temporary Chat**: page context goes into a ChatGPT Temporary Chat (not saved to history or memory).
+- **Temporary Chat by default**: every new chat (app start and New Chat ⌘N) opens as a ChatGPT Temporary Chat
+  (not saved to history or memory), and page context always goes into one. Switch off from the right-click menu →
+  *Always Start in Temporary Chat*.
 - **Hidden details**: emails, phone numbers, card numbers, 12-digit ID numbers and link tokens (`?…`) are
   masked in page text before it is inserted. Your own selected text is sent as-is.
 - Spotify only shares the song details (no private-session detection is possible through Spotify's AppleScript).

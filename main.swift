@@ -60,6 +60,15 @@ enum Settings {
         get { UserDefaults.standard.object(forKey: "useTemporaryChat") as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: "useTemporaryChat") }
     }
+    /// Every new chat (app start and New Chat ⌘N) opens as a Temporary Chat. ON by default.
+    static var startInTemporaryChat: Bool {
+        get { UserDefaults.standard.object(forKey: "startInTemporaryChat") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "startInTemporaryChat") }
+    }
+    /// The address a new chat opens at: a Temporary Chat unless that setting is switched off.
+    static var newChatURL: URL {
+        URL(string: startInTemporaryChat ? "https://chatgpt.com/?temporary-chat=true" : "https://chatgpt.com/")!
+    }
     /// Mask emails / phone / card / ID numbers and strip link tokens in page text.
     static var redact: Bool {
         get { UserDefaults.standard.object(forKey: "redact") as? Bool ?? true }
@@ -673,7 +682,7 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
 
         webView.navigationDelegate = self
         webView.uiDelegate = self
-        webView.load(URLRequest(url: URL(string: "https://chatgpt.com/")!))
+        webView.load(URLRequest(url: Settings.newChatURL))   // Temporary Chat by default
     }
 
     // MARK: Toolbar actions
@@ -683,7 +692,7 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
         lastAutoURL = ""
         readInURL = ""
         readCheckbox.state = .off
-        webView.load(URLRequest(url: URL(string: "https://chatgpt.com/")!))
+        webView.load(URLRequest(url: Settings.newChatURL))   // Temporary Chat by default
     }
     @objc func reload() { webView.reload() }
 
@@ -1270,6 +1279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc func toggleTemporaryChat() { Settings.useTemporaryChat.toggle() }
+    @objc func toggleStartInTemporaryChat() { Settings.startInTemporaryChat.toggle() }
     @objc func toggleRedact() { Settings.redact.toggle() }
 
     /// Opens the blocked-sites text file (creating it first if needed).
@@ -1315,6 +1325,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             item.isEnabled = Settings.readingEnabled
             menu.addItem(item)
         }
+        let startTemp = NSMenuItem(title: "Always Start in Temporary Chat", action: #selector(toggleStartInTemporaryChat), keyEquivalent: "")
+        startTemp.target = self
+        startTemp.state = Settings.startInTemporaryChat ? .on : .off
+        menu.addItem(startTemp)
         let temp = NSMenuItem(title: "Use Temporary Chat for Page Context", action: #selector(toggleTemporaryChat), keyEquivalent: "")
         temp.target = self
         temp.state = Settings.useTemporaryChat ? .on : .off
