@@ -42,8 +42,39 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict></plist>
 PLIST
 
-# "Ad-hoc" signature: free, local-only, lets macOS run the app.
-codesign --force --deep -s - "$APP"
+# Sign the app with a STABLE local certificate (free, made once on this Mac, never leaves it).
+# Why: macOS remembers permissions (Accessibility, Automation) per signature. The old "ad-hoc"
+# signature changed on every build, so macOS treated each build as a new app and kept asking again.
+IDENTITY="GPT Menubar Local Signing"
+KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+if ! security find-certificate -c "$IDENTITY" "$KEYCHAIN" >/dev/null 2>&1; then
+  echo "Creating the local signing certificate (one time only)…"
+  TMP=$(mktemp -d)
+  cat > "$TMP/cert.cnf" <<CNF
+[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = $IDENTITY
+[ext]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature
+extendedKeyUsage = critical,codeSigning
+CNF
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -config "$TMP/cert.cnf" \
+    -keyout "$TMP/key.pem" -out "$TMP/cert.pem" 2>/dev/null
+  # Bundle key + certificate so the Keychain can import them ("-legacy" = format macOS understands;
+  # older openssl versions don't know that flag and already use that format).
+  openssl pkcs12 -export -legacy -inkey "$TMP/key.pem" -in "$TMP/cert.pem" -name "$IDENTITY" \
+    -out "$TMP/id.p12" -passout pass:gptmenubar 2>/dev/null \
+  || openssl pkcs12 -export -inkey "$TMP/key.pem" -in "$TMP/cert.pem" -name "$IDENTITY" \
+    -out "$TMP/id.p12" -passout pass:gptmenubar
+  # -T lets the codesign tool use the key without asking each time.
+  security import "$TMP/id.p12" -k "$KEYCHAIN" -P gptmenubar -T /usr/bin/codesign
+  rm -rf "$TMP"
+fi
+codesign --force --deep -s "$IDENTITY" "$APP"
 
 # Install a copy into Applications so Launchpad / Spotlight / Finder can find it.
 # (/Applications if you can write there, otherwise ~/Applications.)

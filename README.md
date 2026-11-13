@@ -64,4 +64,6 @@ It has no Dock icon; look for the speech-bubble icon in the menu bar (top-right)
   - Chrome / Edge: View → Developer → "Allow JavaScript from Apple Events".
 - The official ChatGPT app also uses ⌥Space; please change its shortcut if you use both.
 
-Rebuilding changes the app's free local signature, so macOS may ask for the Automation permission again after a rebuild.
+The first `./build.sh` creates a free local signing certificate ("GPT Menubar Local Signing") in your login
+keychain and signs every build with it. Because the signature stays the same between builds, macOS remembers the
+Accessibility and Automation permissions instead of asking again after each rebuild.
