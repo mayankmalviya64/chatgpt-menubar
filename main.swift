@@ -999,8 +999,14 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
         panel.allowsMultipleSelection = parameters.allowsMultipleSelection
         panel.canChooseDirectories = parameters.allowsDirectories
         panel.canChooseFiles = true
-        NSApp.activate(ignoringOtherApps: true)
-        panel.begin { result in completionHandler(result == .OK ? panel.urls : nil) }
+        // Show the picker as a sheet that slides down from the chat window, so it stays on
+        // top of it and works over full-screen apps (no app switch needed).
+        if let chatWindow = webView.window {
+            panel.beginSheetModal(for: chatWindow) { result in completionHandler(result == .OK ? panel.urls : nil) }
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+            panel.begin { result in completionHandler(result == .OK ? panel.urls : nil) }
+        }
     }
 
     /// Links / popups that want a new window.
@@ -1050,9 +1056,14 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
 
 /// The floating window. Clicking its red close button just hides it
 /// instead of really closing it (so the chat stays loaded).
-final class ChatWindow: NSWindow {
+/// It's a "non-activating panel" (the same kind of window Spotlight and Raycast use).
+/// Why a panel and not a normal window: macOS only lets a panel appear *inside* another
+/// app's full-screen Space. A normal window either gets hidden behind full-screen Safari
+/// or makes macOS jump back to the desktop — so ⌥Space looked like it did nothing.
+final class ChatWindow: NSPanel {
     var onCloseButton: () -> Void = {}
-    override var canBecomeKey: Bool { true }
+    override var canBecomeKey: Bool { true }     // so you can type into it
+    override var canBecomeMain: Bool { true }
     override func performClose(_ sender: Any?) { onCloseButton() }
 }
 
@@ -1111,8 +1122,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func buildWindow() {
         window = ChatWindow(contentRect: NSRect(origin: .zero, size: normalSize),
-                            styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+                            styleMask: [.titled, .closable, .resizable, .fullSizeContentView, .nonactivatingPanel],
                             backing: .buffered, defer: false)
+        window.hidesOnDeactivate = false             // panels hide when you switch apps by default; we don't want that
+        window.becomesKeyOnlyIfNeeded = false        // always take the keyboard when shown
         window.title = "ChatGPT"
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
@@ -1122,7 +1135,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.isReleasedWhenClosed = false
         window.delegate = self
         // Show on whichever desktop/Space you're on, even over full-screen apps.
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        // .ignoresCycle keeps it out of ⌘` window switching (it's a pop-up, not a document).
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         window.contentViewController = chat          // also starts loading ChatGPT right away
         window.onCloseButton = { [weak self] in self?.hideWindow() }
 
@@ -1182,7 +1196,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// ⌥Space and the menu bar icon both come here.
     func toggleWindow() {
         if window.isVisible {
-            if window.isKeyWindow && NSApp.isActive {
+            // (A non-activating panel can be key without the app being "active", so only check key.)
+            if window.isKeyWindow {
                 hideWindow()
             } else {
                 // Visible but behind another app → just bring it to the front.
@@ -1203,13 +1218,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         chat.windowDidAppear()
     }
 
-    /// Puts the window on top of every other app and makes it ready for typing.
-    /// (Newer macOS can refuse to switch apps while you're typing elsewhere, so we also
-    /// use orderFrontRegardless, which always shows the window on top.)
+    /// Puts the window on top of every other app (even a full-screen one) and makes it ready for typing.
+    /// We deliberately do NOT call NSApp.activate() here: activating the app is what made macOS
+    /// leave the full-screen Space. The non-activating panel takes the keyboard on its own.
+    /// While it's showing it floats above everything; applyPin decides if it stays on top afterwards.
     func bringToFront() {
-        if #available(macOS 14.0, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
-        window.makeKeyAndOrderFront(nil)
+        window.level = .floating
         window.orderFrontRegardless()
+        window.makeKey()
+        window.makeFirstResponder(chat.webView)
+    }
+
+    /// When you move on to another app (e.g. with ⌘Tab) and the window isn't pinned,
+    /// stop floating above everything, same as before this change.
+    func windowDidResignKey(_ notification: Notification) {
+        guard (notification.object as? NSWindow) === window, !Settings.pinned else { return }
+        // Wait a moment to see where the keyboard went: if it's one of our own windows
+        // (file picker, sign-in pop-up), keep floating; only drop down if another app took it.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, NSApp.keyWindow == nil, !Settings.pinned else { return }
+            self.window.level = .normal
+        }
     }
 
     func hideWindow() {
