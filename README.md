@@ -44,8 +44,16 @@ No Xcode project and no paid Apple developer account needed, just the Command Li
 
 ```sh
 ./build.sh
-open "build/GPT Menubar.app"
 ```
+
+This builds the app and installs it as **/Applications/GPT Menubar.app** (or ~/Applications if /Applications
+isn't writable). To open it:
+
+- **Spotlight**: ⌘Space → type `GPT Menubar` or `ChatGPT menu bar` → Return
+- **Finder**: Applications → GPT Menubar
+- **Terminal**: `open "/Applications/GPT Menubar.app"`
+
+It has no Dock icon; look for the speech-bubble icon in the menu bar (top-right), or press **⌥Space**.
 
 ## One-time setup
 
