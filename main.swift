@@ -1,6 +1,7 @@
-// ChatGPT Bar — a tiny menu bar app that shows chatgpt.com in a floating window
-// (toggle with ⌥Space or the menu bar icon)
-// and can pull in the text of the web page you are looking at in Safari/Chrome.
+// GPT Menubar (formerly "ChatGPT Bar") — a tiny menu bar app that shows chatgpt.com
+// in a floating window (toggle with ⌥Space or the menu bar icon)
+// and can pull in what you are looking at: a web page in Safari / Chrome / Edge,
+// a PDF in Preview, or the song playing in Spotify or YouTube Music.
 //
 // Build:  ./build.sh      (no Xcode project, no paid developer account needed)
 
@@ -10,11 +11,39 @@ import ServiceManagement
 import PDFKit        // reads the text of PDFs open in Preview
 import Carbon          // for the system-wide ⌥Space keyboard shortcut
 
+// MARK: - App name
+
+/// The app's name, used in menus, alerts and folder names.
+let appName = "GPT Menubar"
+
+/// One-time move of settings from the old "ChatGPT Bar" app, so nothing is lost after the rename.
+/// (Old settings lived under the bundle ID "local.chatgpt-bar"; the blocked-sites file lived in
+/// "~/Library/Application Support/ChatGPT Bar".)
+func migrateFromOldName() {
+    let defaults = UserDefaults.standard
+    guard !defaults.bool(forKey: "migratedFromChatGPTBar") else { return }   // already done
+    // 1) Copy every old setting we don't already have (switches, window position, …).
+    if let old = defaults.persistentDomain(forName: "local.chatgpt-bar") {
+        for (key, value) in old where defaults.object(forKey: key) == nil {
+            defaults.set(value, forKey: key)
+        }
+    }
+    // 2) Copy the blocked-sites list into the new folder.
+    let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    let oldList = support.appendingPathComponent("ChatGPT Bar/blocked-sites.txt")
+    let newList = support.appendingPathComponent("\(appName)/blocked-sites.txt")
+    if FileManager.default.fileExists(atPath: oldList.path) && !FileManager.default.fileExists(atPath: newList.path) {
+        try? FileManager.default.createDirectory(at: newList.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? FileManager.default.copyItem(at: oldList, to: newList)
+    }
+    defaults.set(true, forKey: "migratedFromChatGPTBar")
+}
+
 // MARK: - Settings (saved between launches)
 
 /// Small wrapper around UserDefaults so settings survive app restarts.
 enum Settings {
-    /// Privacy master switch. When false the app never looks at Safari/Chrome/Preview at all.
+    /// Privacy master switch. When false the app never looks at Safari / Chrome / Edge / Preview / Spotify at all.
     static var readingEnabled: Bool {
         get { UserDefaults.standard.object(forKey: "readingEnabled") as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: "readingEnabled") }
@@ -61,17 +90,26 @@ struct PageContext {
     var text: String?        // nil when we could not read the page text
     var error: String?       // explains why text could not be read
     var shield: Shield = .none   // set when we deliberately did NOT read (private window, blocked site)
+    var musicService: String? = nil   // "Spotify" / "YouTube Music" when this is a song, not a page
 }
 
-/// The only apps ChatGPT Bar may read from (through AppleScript).
-/// "safari", "chromium" and "preview" each need slightly different AppleScript words.
+/// The only apps GPT Menubar may read from (through AppleScript).
+/// "safari", "chromium", "preview" and "spotify" each need slightly different AppleScript words.
+/// (Microsoft Edge is built on Chromium, so it speaks the same AppleScript as Chrome.)
 let knownBrowsers: [String: (appName: String, kind: String)] = [
-    "com.apple.Safari":  ("Safari", "safari"),
-    "com.google.Chrome": ("Google Chrome", "chromium"),
-    "com.apple.Preview": ("Preview", "preview"),     // PDFs: text is read straight from the file
+    "com.apple.Safari":      ("Safari", "safari"),
+    "com.google.Chrome":     ("Google Chrome", "chromium"),
+    "com.microsoft.edgemac": ("Microsoft Edge", "chromium"),
+    "com.apple.Preview":     ("Preview", "preview"),     // PDFs: text is read straight from the file
+    "com.spotify.client":    ("Spotify", "spotify"),     // the song that is playing
 ]
 /// Order used in menus.
-let knownAppOrder = ["com.apple.Safari", "com.google.Chrome", "com.apple.Preview"]
+let knownAppOrder = ["com.apple.Safari", "com.google.Chrome", "com.microsoft.edgemac", "com.apple.Preview", "com.spotify.client"]
+
+/// YouTube Music runs as a website (music.youtube.com) inside Safari, Chrome or Edge.
+func isYouTubeMusic(_ urlString: String) -> Bool {
+    URL(string: urlString)?.host?.lowercased() == "music.youtube.com"
+}
 
 // MARK: - Privacy: private windows, blocked sites, hiding personal details
 
@@ -87,7 +125,7 @@ enum Shield {
 func shieldMessage(_ shield: Shield, app: String) -> String {
     switch shield {
     case .privateWindow: return "Private window — nothing read"
-    case .unverified:    return app == "Safari" ? "Safari not read — allow Accessibility to check for private windows" : "\(app) not read — couldn't check for Incognito"
+    case .unverified:    return app == "Safari" ? "Safari not read — allow Accessibility to check for private windows" : "\(app) not read — couldn't check for Incognito / InPrivate"
     case .blockedSite:   return "Blocked site — nothing read"
     case .none:          return ""
     }
@@ -101,10 +139,13 @@ func privateWindowCheck(bundleID: String) -> Shield {
     guard let browser = knownBrowsers[bundleID] else { return .none }
     switch browser.kind {
     case "chromium":
-        // Chrome tells us directly: "incognito" or "normal".
+        // Chrome and Edge tell us directly: "normal", or "incognito" (Edge's InPrivate).
+        // Fail-safe: anything other than "normal" is treated as private.
         let r = runAppleScript("tell application \"\(browser.appName)\" to if (count of windows) > 0 then return mode of front window")
         if let error = r.error { lastReadError = "\(browser.appName): \(error)"; return .unverified }
-        return r.result == "incognito" ? .privateWindow : .none
+        let mode = r.result ?? ""
+        if mode.isEmpty { return .none }            // no windows open → nothing to read anyway
+        return mode == "normal" ? .none : .privateWindow
     case "safari":
         // Safari's AppleScript can't tell private windows apart, but macOS Accessibility
         // names them "<page>, Private Browsing". No permission → don't read Safari at all.
@@ -128,16 +169,16 @@ func privateWindowCheck(bundleID: String) -> Shield {
         let title = (titleRef as? String) ?? ""
         return title.contains("Private Browsing") ? .privateWindow : .none
     default:
-        return .none     // Preview has no private mode
+        return .none     // Preview has no private mode; Spotify only shares the song name
     }
 }
 
 /// The blocked-sites list lives in a plain text file you can edit.
 let blocklistURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-    .appendingPathComponent("ChatGPT Bar/blocked-sites.txt")
+    .appendingPathComponent("\(appName)/blocked-sites.txt")
 
 let defaultBlocklist = """
-# ChatGPT Bar never reads pages from these sites (treated like a private window).
+# GPT Menubar never reads pages from these sites (treated like a private window).
 # One site per line. "example.com" also covers its subdomains (mail.example.com).
 # Use * as a wildcard, e.g. *bank* blocks every site with "bank" in its name.
 # Lines starting with # are ignored. Save the file; changes apply right away.
@@ -305,6 +346,11 @@ let selectionJS = "String(window.getSelection())"
 
 let pageTextJS = "(function(){var nl=String.fromCharCode(10);var s=String(window.getSelection());if(s.trim().length>0){return 'SELECTED TEXT:'+nl+s;}var el=document.querySelector('article')||document.querySelector('main')||document.body;return el?el.innerText:'';})()"
 
+/// YouTube Music tab: the song in the player bar at the bottom (title, artist / album, time)
+/// plus the lyrics if the Lyrics tab has them. Returns '' when nothing is playing.
+/// (Same rules as above: single quotes only, no backslashes.)
+let ytMusicJS = "(function(){var nl=String.fromCharCode(10);var b=document.querySelector('ytmusic-player-bar');if(!b){return '';}function txt(sel,root){var e=(root||document).querySelector(sel);return e?e.innerText.trim():'';}var title=txt('.title',b);if(!title){return '';}var out='Now playing on YouTube Music:'+nl+'Track: '+title+nl+'Artist / album: '+txt('.byline',b);var tm=txt('.time-info',b);if(tm){out+=nl+'Position: '+tm;}var ly=txt('ytmusic-description-shelf-renderer .description');if(ly){out+=nl+nl+'Lyrics:'+nl+ly;}return out;})()"
+
 /// Runs an AppleScript and returns its text result, or an error message.
 /// Error number -1743 means macOS has not allowed this app to control that browser.
 func runAppleScript(_ source: String) -> (result: String?, error: String?) {
@@ -364,6 +410,11 @@ func readPage(bundleID: String, includeText: Bool, wholePage: Bool = false) -> P
         ctx?.bundleID = bundleID
         return ctx
     }
+    if browser.kind == "spotify" {
+        var ctx = readSpotify()
+        ctx?.bundleID = bundleID
+        return ctx
+    }
     // Privacy first: private / Incognito windows are never read — not even the title.
     let shield = privateWindowCheck(bundleID: bundleID)
     if shield != .none {
@@ -390,14 +441,25 @@ func readPage(bundleID: String, includeText: Bool, wholePage: Bool = false) -> P
     if isBlockedSite(ctx.url) {
         return PageContext(bundleID: bundleID, browserName: app, title: "", url: "", text: nil, error: nil, shield: .blockedSite)
     }
+    let onYouTubeMusic = isYouTubeMusic(ctx.url)
+    if onYouTubeMusic { ctx.musicService = "YouTube Music" }
     if !includeText { return ctx }
-    let pageJS = wholePage ? fullPageJS : pageTextJS
 
     // 2) Page text (needs "Allow JavaScript from Apple Events" turned on in the browser).
-    let jsScript = browser.kind == "safari"
-        ? "tell application \"\(app)\" to do JavaScript \"\(pageJS)\" in \(tab)"
-        : "tell application \"\(app)\" to execute \(tab) javascript \"\(pageJS)\""
-    let js = runAppleScript(jsScript)
+    func runJS(_ pageJS: String) -> (result: String?, error: String?) {
+        let jsScript = browser.kind == "safari"
+            ? "tell application \"\(app)\" to do JavaScript \"\(pageJS)\" in \(tab)"
+            : "tell application \"\(app)\" to execute \(tab) javascript \"\(pageJS)\""
+        return runAppleScript(jsScript)
+    }
+    // On YouTube Music, read the song from the player bar; if nothing is playing,
+    // fall back to the normal page text.
+    var js: (result: String?, error: String?) = (nil, nil)
+    if onYouTubeMusic { js = runJS(ytMusicJS) }
+    if (js.result ?? "").isEmpty {
+        if onYouTubeMusic && js.error == nil { ctx.musicService = nil }   // just browsing, no song
+        js = runJS(wholePage ? fullPageJS : pageTextJS)
+    }
     if let text = js.result, !text.isEmpty {
         ctx.text = text
     } else {
@@ -406,10 +468,10 @@ func readPage(bundleID: String, includeText: Bool, wholePage: Bool = false) -> P
     return ctx
 }
 
-/// The text currently selected in Safari/Chrome ("" if none or not allowed).
+/// The text currently selected in Safari / Chrome / Edge ("" if none or not allowed).
 /// (Preview selections arrive through the right-click "Ask ChatGPT" service instead.)
 func readSelection(bundleID: String) -> String {
-    guard let browser = knownBrowsers[bundleID], browser.kind != "preview" else { return "" }
+    guard let browser = knownBrowsers[bundleID], browser.kind == "safari" || browser.kind == "chromium" else { return "" }
     guard privateWindowCheck(bundleID: bundleID) == .none else { return "" }   // never peek into private windows
     let tab = browser.kind == "safari" ? "current tab of front window" : "active tab of front window"
     let script = browser.kind == "safari"
@@ -457,6 +519,47 @@ func readPreview(includeText: Bool) -> PageContext? {
     return ctx
 }
 
+/// Turns seconds into "m:ss", e.g. 83 → "1:23".
+func minutesSeconds(_ seconds: Double) -> String {
+    let s = max(0, Int(seconds))
+    return String(format: "%d:%02d", s / 60, s % 60)
+}
+
+/// Spotify desktop app: the track that is playing (or paused) right now.
+/// Spotify has no page text, so the "text" is the song details.
+func readSpotify() -> PageContext? {
+    // One line each: name, artist, album, spotify:… link, playing/paused, position (s), length (ms).
+    let info = runAppleScript("""
+    tell application "Spotify"
+        if player state is stopped then return ""
+        set t to current track
+        return (name of t) & linefeed & (artist of t) & linefeed & (album of t) & linefeed & (spotify url of t) & linefeed & (player state as string) & linefeed & (player position as string) & linefeed & ((duration of t) as string)
+    end tell
+    """)
+    if let error = info.error { lastReadError = "Spotify: \(error)" }
+    guard let raw = info.result, !raw.isEmpty else { return nil }
+    let p = raw.components(separatedBy: "\n")
+    guard p.count >= 7, !p[0].isEmpty else { return nil }
+    let (name, artist, album, spotifyURI, state) = (p[0], p[1], p[2], p[3], p[4])
+    if spotifyURI.contains(":ad:") { lastReadError = "Spotify is playing an ad"; return nil }
+
+    // "spotify:track:abc123" → "https://open.spotify.com/track/abc123" (a normal web link).
+    var link = ""
+    let uri = spotifyURI.components(separatedBy: ":")
+    if uri.count == 3, uri[0] == "spotify", uri[1] != "local" {
+        link = "https://open.spotify.com/\(uri[1])/\(uri[2])"
+    }
+    // Some Macs write decimals with a comma ("83,5"), so swap it for a dot before reading the number.
+    let position = Double(p[5].replacingOccurrences(of: ",", with: ".")) ?? 0
+    let length = (Double(p[6].replacingOccurrences(of: ",", with: ".")) ?? 0) / 1000   // ms → s
+
+    var text = "Now playing in Spotify (\(state)):\nTrack: \(name)\nArtist: \(artist)\nAlbum: \(album)"
+    if length > 0 { text += "\nPosition: \(minutesSeconds(position)) of \(minutesSeconds(length))" }
+    var ctx = PageContext(browserName: "Spotify", title: "\(name) — \(artist)", url: link, text: text, error: nil)
+    ctx.musicService = "Spotify"
+    return ctx
+}
+
 // MARK: - Main window content (toolbar + ChatGPT web view)
 
 final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
@@ -464,14 +567,14 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
     let pageLabel = NSTextField(labelWithString: "No page")
     let autoCheckbox = NSButton(checkboxWithTitle: "Auto", target: nil, action: nil)
     let pinButton = NSButton()
-    let privacyButton = NSButton()               // 📃 privacy switch: page reading on/off
-    let addButton = NSButton()
+    let readCheckbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)   // ticked = page read in
     var popupWindows: [NSWindow] = []        // login popups (Google/Apple/Microsoft)
     var pageLoaded = false
     var lastAutoURL = ""                     // page we already auto-added (avoid duplicates)
     var pendingAutoAdd = false               // auto-add waiting for the page to finish loading
     var lastSelection = ""                   // selection we already asked about (avoid duplicates)
     var suppressAutoOnce = false             // skip auto-add when "Ask ChatGPT" opened the window
+    var readInURL = ""                       // page whose TEXT is in the message box (drives the checkbox tick)
 
     /// Which browser to read from — set by the AppDelegate.
     var browserBundleID: () -> String? = { nil }
@@ -505,23 +608,18 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
             b.toolTip = tip
             return b
         }
-        privacyButton.isBordered = false
-        privacyButton.target = self
-        privacyButton.action = #selector(privacyToggled)
-
-        let addButton = self.addButton
-        addButton.title = "Add page"
-        addButton.target = self
-        addButton.action = #selector(addPageClicked)
-        addButton.bezelStyle = .rounded
-        addButton.controlSize = .small
-        addButton.toolTip = "Put the current Safari/Chrome page (or your selected text) into the message box"
+        // "Page read" checkbox (no label) at the start of the toolbar.
+        // Ticked = the current page / song is already in the message box. Click it to add it.
+        readCheckbox.target = self
+        readCheckbox.action = #selector(readCheckboxClicked)
+        readCheckbox.state = .off
+        readCheckbox.toolTip = "Ticked when this page is read into the message box. Click to add the current Safari / Chrome / Edge page, Preview PDF or Spotify / YouTube Music song."
 
         autoCheckbox.target = self
         autoCheckbox.action = #selector(autoToggled)
         autoCheckbox.state = Settings.autoContext ? .on : .off
         autoCheckbox.controlSize = .small
-        autoCheckbox.toolTip = "Automatically add the page each time you open ChatGPT Bar on a new page"
+        autoCheckbox.toolTip = "Automatically add the page (or song) each time you open \(appName) on a new one"
 
         pinButton.image = NSImage(systemSymbolName: Settings.pinned ? "pin.fill" : "pin", accessibilityDescription: "Pin")
         pinButton.isBordered = false
@@ -534,13 +632,23 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
         pageLabel.textColor = .secondaryLabelColor
         pageLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        // Invisible stretchy gap: it takes up all spare width, which pushes
+        // Auto / pin / resize / reload to the right-hand corner of the toolbar.
+        // (When the window is narrow it shrinks first, before the page name does.)
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+
         let bar = NSStackView(views: [
             iconButton("square.and.pencil", "New chat (⌘N)", #selector(newChat)),
-            privacyButton, pageLabel, addButton, autoCheckbox, pinButton,
+            readCheckbox, pageLabel,     // the checkbox sits where the 📃 icon used to be
+            spacer,
+            autoCheckbox, pinButton,
             iconButton("arrow.up.left.and.arrow.down.right", "Bigger / smaller", #selector(toggleSize)),
             iconButton("arrow.clockwise", "Reload (⌘R)", #selector(reload)),
         ])
         bar.orientation = .horizontal
+        bar.distribution = .fill      // lets the spacer stretch to fill the gap
         bar.spacing = 6
         // Left inset leaves room for the window's red close button (the toolbar sits in the title bar).
         bar.edgeInsets = NSEdgeInsets(top: 2, left: 30, bottom: 2, right: 8)
@@ -570,31 +678,36 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
 
     // MARK: Toolbar actions
 
-    @objc func newChat() { webView.load(URLRequest(url: URL(string: "https://chatgpt.com/")!)) }
+    @objc func newChat() {
+        // A fresh chat has an empty message box, so the page is no longer "read in".
+        lastAutoURL = ""
+        readInURL = ""
+        readCheckbox.state = .off
+        webView.load(URLRequest(url: URL(string: "https://chatgpt.com/")!))
+    }
     @objc func reload() { webView.reload() }
-    @objc func addPageClicked() { addPage(manual: true) }
-    /// 📃 button: turn all page reading on or off.
-    @objc func privacyToggled() {
-        Settings.readingEnabled.toggle()
-        refreshPrivacyUI()
-        if Settings.readingEnabled { windowDidAppear() }
+
+    /// The "page read" checkbox was clicked.
+    /// (macOS flips the tick before calling this, so .off here means it WAS ticked.)
+    @objc func readCheckboxClicked() {
+        if readCheckbox.state == .off {
+            readCheckbox.state = .on        // already read in — keep the tick, don't add it twice
+            return
+        }
+        addPage(manual: true)               // sets the tick on success, clears it on failure
     }
 
-    /// Updates the page icon and greys out Add page / Auto while reading is off.
+    /// Greys out the page checkbox / Auto while reading is off.
+    /// (Reading is switched on/off from the menu bar icon's right-click menu → "Read Pages from Apps".)
     func refreshPrivacyUI() {
         let on = Settings.readingEnabled
-        // A plain page icon (📃). When reading is off: the crossed-out page, in red.
-        // ("text.page.slash" needs macOS 15; older macOS falls back to an empty page.)
-        let offIcon = NSImage(systemSymbolName: "text.page.slash", accessibilityDescription: "Page reading off")
-            ?? NSImage(systemSymbolName: "doc", accessibilityDescription: "Page reading off")
-        privacyButton.image = on ? NSImage(systemSymbolName: "doc.text", accessibilityDescription: "Page reading on") : offIcon
-        privacyButton.contentTintColor = on ? nil : .systemRed
-        privacyButton.toolTip = on
-            ? "Page reading is ON (Safari, Chrome, Preview). Click to turn it off for privacy."
-            : "Page reading is OFF: nothing is read from your apps. Click to turn it back on."
-        addButton.isEnabled = on
+        readCheckbox.isEnabled = on
         autoCheckbox.isEnabled = on
-        if !on { pageLabel.stringValue = "Page reading off"; pageLabel.toolTip = nil }
+        if !on {
+            readCheckbox.state = .off
+            pageLabel.stringValue = "Page reading off"
+            pageLabel.toolTip = "Turn it back on from the menu bar icon's right-click menu → Read Pages from Apps"
+        }
     }
 
     @objc func autoToggled() { Settings.autoContext = autoCheckbox.state == .on }
@@ -616,20 +729,24 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
         if suppressAutoOnce { suppressAutoOnce = false; return }   // "Ask ChatGPT" handles this opening
         guard Settings.readingEnabled else { refreshPrivacyUI(); return }
         guard let ctx = findPage(lastUsed: browserBundleID(), includeText: false) else {
-            pageLabel.stringValue = isPermissionError ? "Needs permission — click Add page" : "Open a page in Safari, Chrome or Preview"
+            readCheckbox.state = .off
+            pageLabel.stringValue = isPermissionError ? "Needs permission — click the checkbox" : "Open a page, a PDF, or play a song"
             pageLabel.toolTip = lastReadError
             return
         }
         // Private window or blocked site: say so, and do nothing else.
         if ctx.shield != .none {
+            readCheckbox.state = .off
             pageLabel.stringValue = shieldMessage(ctx.shield, app: ctx.browserName)
             pageLabel.toolTip = pageLabel.stringValue
             return
         }
+        // Tick the checkbox only if THIS page/song is the one already read into the message box.
+        readCheckbox.state = (!ctx.url.isEmpty && ctx.url == readInURL) ? .on : .off
         pageLabel.stringValue = ctx.title.isEmpty ? ctx.url : ctx.title
         pageLabel.toolTip = "\(ctx.browserName): \(ctx.url)"
 
-        // Text selected in Safari/Chrome? Ask about that selection (with the page as background).
+        // Text selected in Safari / Chrome / Edge? Ask about that selection (with the page as background).
         if Settings.autoContext && Settings.isAppAllowed(ctx.bundleID) {
             let selection = readSelection(bundleID: ctx.bundleID)
             if !selection.isEmpty && selection != lastSelection {
@@ -648,7 +765,8 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
     /// Reads the page text and drops it into ChatGPT's message box.
     func addPage(manual: Bool) {
         guard let ctx = findPage(lastUsed: browserBundleID(), includeText: true) else {
-            pageLabel.stringValue = isPermissionError ? "Needs permission to read your apps" : "No Safari/Chrome/Preview page found"
+            readCheckbox.state = .off
+            pageLabel.stringValue = isPermissionError ? "Needs permission to read your apps" : "No page, PDF or song found"
             pageLabel.toolTip = lastReadError
             if manual { showReadFailureHelp() }
             return
@@ -656,6 +774,7 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
         if ctx.shield != .none {
             pageLabel.stringValue = shieldMessage(ctx.shield, app: ctx.browserName)
             pageLabel.toolTip = pageLabel.stringValue
+            readCheckbox.state = .off
             if manual { NSSound.beep() }
             return
         }
@@ -663,9 +782,15 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
 
         let isFile = ctx.url.hasPrefix("file:")
         let shownURL = Settings.redact ? stripLinkTokens(ctx.url) : ctx.url
-        var message = isFile
-            ? "Context from the document I'm viewing in \(ctx.browserName):\nTitle: \(ctx.title)\nFile: \(URL(string: ctx.url)?.path ?? ctx.url)\n"
-            : "Context from the page I'm viewing:\nTitle: \(ctx.title)\nURL: \(shownURL)\n"
+        var message: String
+        if let service = ctx.musicService {
+            // A song (Spotify / YouTube Music) rather than a page to read.
+            message = "What I'm listening to on \(service):\n" + (shownURL.isEmpty ? "" : "Link: \(shownURL)\n")
+        } else if isFile {
+            message = "Context from the document I'm viewing in \(ctx.browserName):\nTitle: \(ctx.title)\nFile: \(URL(string: ctx.url)?.path ?? ctx.url)\n"
+        } else {
+            message = "Context from the page I'm viewing:\nTitle: \(ctx.title)\nURL: \(shownURL)\n"
+        }
         if var text = ctx.text {
             if Settings.redact { text = redactPersonalDetails(text) }
             // Very long pages are cut so the message stays reasonable.
@@ -679,11 +804,14 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
         message += "\n---\n"
         deliver(message)
         pageLabel.stringValue = (ctx.text != nil ? "Added: " : "Added link only: ") + (ctx.title.isEmpty ? ctx.url : ctx.title)
+        // Tick = the page text was read. Only the title/link (no text) leaves it unticked.
+        readInURL = ctx.text != nil ? ctx.url : ""
+        readCheckbox.state = ctx.text != nil ? .on : .off
     }
 
     /// "Ask about this selection": puts the selected text in the message box, plus the whole
     /// page/PDF as background, then leaves the cursor for your question.
-    /// If the 📃 privacy switch is off, only the selected text (which you chose to send) is used.
+    /// If page reading is switched off, only the selected text (which you chose to send) is used.
     func ask(selection: String, sourceID: String?) {
         lastSelection = selection
         var ctx: PageContext? = nil
@@ -709,6 +837,9 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
         }
         message += "\n---\nMy question about the selected part: "
         deliver(message)
+        // Ticked when the page text came along with the selection.
+        readInURL = ctx?.text != nil ? (ctx?.url ?? "") : ""
+        readCheckbox.state = ctx?.text != nil ? .on : .off
         if shielded != .none {
             pageLabel.stringValue = shieldMessage(shielded, app: knownBrowsers[sourceID ?? ""]?.appName ?? "") + " — only your selection was sent"
         } else {
@@ -772,27 +903,27 @@ final class ChatViewController: NSViewController, WKNavigationDelegate, WKUIDele
     func showReadFailureHelp() {
         let alert = NSAlert()
         if isPermissionError {
-            alert.messageText = "Please allow ChatGPT Bar to read your browser"
-            alert.informativeText = "macOS is blocking it. In System Settings → Privacy & Security → Automation, turn on Safari, Google Chrome and Preview under ChatGPT Bar.\n\n(\(lastReadError ?? ""))"
+            alert.messageText = "Please allow \(appName) to read your apps"
+            alert.informativeText = "macOS is blocking it. In System Settings → Privacy & Security → Automation, turn on Safari, Google Chrome, Microsoft Edge, Preview and Spotify under \(appName).\n\n(\(lastReadError ?? ""))"
             alert.addButton(withTitle: "Open Automation Settings")
             alert.addButton(withTitle: "Cancel")
             if alert.runModal() == .alertFirstButtonReturn {
                 NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")!)
             }
         } else {
-            alert.messageText = "No Safari, Chrome or Preview page found"
-            alert.informativeText = "Please open a web page in Safari or Chrome, or a PDF in Preview, then try again. (Also check the app is ticked in the menu bar icon's right-click menu.)" + (lastReadError.map { "\n\n(\($0))" } ?? "")
+            alert.messageText = "No page, PDF or song found"
+            alert.informativeText = "Please open a web page in Safari, Chrome or Edge (YouTube Music works there too), a PDF in Preview, or play something in Spotify, then try again. (Also check the app is ticked in the menu bar icon's right-click menu.)" + (lastReadError.map { "\n\n(\($0))" } ?? "")
             alert.runModal()
         }
     }
 
     func showJavaScriptHelp(browser: String, error: String) {
         let alert = NSAlert()
-        alert.messageText = "Allow ChatGPT Bar to read page text"
+        alert.messageText = "Allow \(appName) to read page text"
         let where_ = browser.contains("Safari")
             ? "Safari → Settings → Advanced → tick \"Show features for web developers\", then Develop menu → tick \"Allow JavaScript from Apple Events\"."
             : "\(browser) → View → Developer → tick \"Allow JavaScript from Apple Events\"."
-        alert.informativeText = "Only the page title and link were added.\n\nOne-time setup: \(where_)\n\nAlso allow ChatGPT Bar under System Settings → Privacy & Security → Automation.\n\n(\(error))"
+        alert.informativeText = "Only the page title and link were added.\n\nOne-time setup: \(where_)\n\nAlso allow \(appName) under System Settings → Privacy & Security → Automation.\n\n(\(error))"
         alert.runModal()
     }
 
@@ -926,7 +1057,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var window: ChatWindow!
     let chat = ChatViewController()
     var clickOutsideMonitor: Any?
-    var lastBrowserID: String?     // last Safari/Chrome window you used
+    var lastBrowserID: String?     // last supported app you used (browser, Preview, Spotify)
     var hotKeyRef: EventHotKeyRef?
 
     let normalSize = NSSize(width: 440, height: 680)
@@ -934,6 +1065,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         sharedDelegate = self
+        migrateFromOldName()        // bring over settings from the old "ChatGPT Bar" app (first launch only)
         buildMainMenu()
 
         // Menu bar icon.
@@ -942,12 +1074,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusItem.button?.target = self
         statusItem.button?.action = #selector(statusItemClicked)
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
-        statusItem.button?.toolTip = "ChatGPT Bar (⌥Space)"
+        statusItem.button?.toolTip = "\(appName) (⌥Space)"
 
         buildWindow()
         registerHotKey()
 
-        // Right-click → "Ask ChatGPT" on selected text (Safari, Chrome, Preview only — see build.sh).
+        // Right-click → "Ask ChatGPT" on selected text (Safari, Chrome, Edge, Preview only — see build.sh).
         NSApp.servicesProvider = self
         NSUpdateDynamicServices()
 
@@ -1204,7 +1336,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hint.isEnabled = false
         menu.addItem(hint)
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Quit ChatGPT Bar", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "Quit \(appName)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
         statusItem.button?.performClick(nil)   // shows the menu
         statusItem.menu = nil                  // so left-click goes back to opening the window

@@ -1,30 +1,40 @@
-# ChatGPT Bar
+# GPT Menubar
 
-A small macOS menu bar app that keeps ChatGPT one shortcut away and can bring in the page you're reading.
+A small macOS menu bar app that keeps ChatGPT one shortcut away and can bring in what you're
+reading or listening to. (Formerly called "ChatGPT Bar"; settings carry over automatically.)
 
 - **⌥Space** (or the menu bar icon) shows / hides a ChatGPT window, bottom-right by default.
 - Resizable; reopens exactly where you left it, at the same size.
 - Log in once to your own ChatGPT account; uploads, voice, downloads all work.
-- **Page context**: reads the page open in **Safari**, **Chrome**, or a PDF in **Preview**
-  (your selected text if any, otherwise the main text) and puts it into the message box.
-  - **Auto**: adds the page each time you open the window on a new page.
-  - **Add page**: adds it on demand.
-  - **Ask about a selection**: select text in Safari, Chrome or Preview → right-click → **Ask ChatGPT**
+- **Page context**: reads
+  - the page open in **Safari**, **Chrome** or **Microsoft Edge** (your selected text if any, otherwise the main text),
+  - a PDF in **Preview**,
+  - the song playing in **Spotify** (track, artist, album, position, link),
+  - the song playing on **YouTube Music** (music.youtube.com in Safari, Chrome or Edge: track, artist / album,
+    position, and the lyrics if the Lyrics tab has them),
+
+  and puts it into the message box.
+  - **☑ checkbox** (start of the toolbar): ticked when the current page / song has been read into the
+    message box, unticked otherwise. Click it to add the page.
+  - **Auto**: adds the page each time you open the window on a new page or song.
+  - **Ask about a selection**: select text in Safari, Chrome, Edge or Preview → right-click → **Ask ChatGPT**
     (under Services if macOS groups it there). The selection is sent with the whole page/PDF as
-    background, and the cursor waits for your question. ⌥Space with text selected in Safari/Chrome does the same.
-  - **📃 privacy switch** (page icon): turns all reading off. Per-app ticks are in the menu bar icon's right-click menu.
+    background, and the cursor waits for your question. ⌥Space with text selected in a browser does the same.
+  - Turn all reading off, or untick single apps, from the menu bar icon's right-click menu
+    (*Read Pages from Apps*).
 
 ## Privacy
 
-- **Private windows are never read.** Chrome Incognito is detected directly. Safari Private is detected
-  through macOS Accessibility (grant it once); without that permission Safari is simply not read (fail-safe).
+- **Private windows are never read.** Chrome Incognito and Edge InPrivate are detected directly. Safari Private is
+  detected through macOS Accessibility (grant it once); without that permission Safari is simply not read (fail-safe).
   In a private window, right-click → Ask ChatGPT sends **only the text you selected**, never the page, title or link.
 - **Blocked sites** (email, banks, payments, password managers, health, sign-in pages…) are treated the same way.
   Edit the list from the menu bar icon's right-click menu → *Edit Blocked Sites…*
 - **Temporary Chat**: page context goes into a ChatGPT Temporary Chat (not saved to history or memory).
 - **Hidden details**: emails, phone numbers, card numbers, 12-digit ID numbers and link tokens (`?…`) are
   masked in page text before it is inserted. Your own selected text is sent as-is.
-- All of these can be switched in the right-click menu; the 📃 button turns all reading off.
+- Spotify only shares the song details (no private-session detection is possible through Spotify's AppleScript).
+- All of these can be switched in the right-click menu.
 
 ## Build
 
@@ -32,16 +42,16 @@ No Xcode project and no paid Apple developer account needed, just the Command Li
 
 ```sh
 ./build.sh
-open "build/ChatGPT Bar.app"
+open "build/GPT Menubar.app"
 ```
 
 ## One-time setup
 
-- Click **Allow** when macOS asks whether ChatGPT Bar may control Safari / Chrome / Preview
+- Click **Allow** when macOS asks whether GPT Menubar may control Safari / Chrome / Edge / Preview / Spotify
   (or System Settings → Privacy & Security → Automation).
-- For web page **text** (not just title + link):
+- For web page **text** (not just title + link), including YouTube Music:
   - Safari: Settings → Advanced → "Show features for web developers", then Develop → "Allow JavaScript from Apple Events".
-  - Chrome: View → Developer → "Allow JavaScript from Apple Events".
+  - Chrome / Edge: View → Developer → "Allow JavaScript from Apple Events".
 - The official ChatGPT app also uses ⌥Space; please change its shortcut if you use both.
 
 Rebuilding changes the app's free local signature, so macOS may ask for the Automation permission again after a rebuild.
